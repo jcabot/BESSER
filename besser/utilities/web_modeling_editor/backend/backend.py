@@ -8,6 +8,7 @@ import asyncio
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
+import subprocess
 
 from besser.utilities.buml_code_builder import domain_model_to_code
 from besser.utilities.web_modeling_editor.backend.services import run_docker_compose
@@ -33,6 +34,7 @@ from besser.utilities.web_modeling_editor.backend.services.buml_to_json import (
     domain_model_to_json,
     parse_buml_content,
     state_machine_to_json,
+    agent_buml_to_json,
 )
 from besser.utilities.web_modeling_editor.backend.services.ocl_checker import (
     check_ocl_constraint,
@@ -350,6 +352,116 @@ async def deploy_app(input_data: ClassDiagramInput):
         print(f"Error during file generation or django deployment: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
+
+@api.post("/deploy-agent")
+async def deploy_agent(input_data: ClassDiagramInput):
+    temp_dir = tempfile.mkdtemp(prefix=f"besser_{uuid.uuid4().hex}_")
+    try:
+        json_data = input_data.model_dump()
+        generator = input_data.generator
+
+        if generator not in GENERATOR_CONFIG:
+            raise HTTPException(
+                status_code=400, detail="Invalid generator type specified."
+            )
+
+        buml_model = None
+
+        buml_model = process_agent_diagram(input_data.elements)
+
+        import subprocess
+
+        prefix = (
+            "import sys, os\n"
+            "from besser.generators.agents.baf_generator import BAFGenerator\n\n"
+        )
+
+        project_root = os.path.abspath(".")
+        prefix = (
+            "from besser.generators.agents.baf_generator import BAFGenerator\n\n"
+        )
+        suffix = "\ngenerator = BAFGenerator(agent)\ngenerator.generate()\n"
+
+        full_code = prefix + buml_model + suffix
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".py", mode="w"
+        ) as tmp_file:
+            tmp_file.write(full_code)
+            tmp_file_path = tmp_file.name
+
+        try:
+            result = subprocess.run(
+                ["python", tmp_file_path],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            if result.stderr:
+                print("Execution errors:\n", result.stderr)
+
+        except subprocess.CalledProcessError as e:
+            print("Script failed with error:")
+            print(e.stderr)
+
+        finally:
+            # os.remove(tmp_file_path)  # Clean up the temp file
+            print("fail")
+
+
+        generator_class = GENERATOR_CONFIG[generator]
+        # Start the agent.py script in the output directory and return an OK message
+        output_dir = os.path.join("output")
+        agent_script = os.path.join(output_dir, "generated_state_machine.py")
+        if not os.path.exists(agent_script):
+            raise HTTPException(
+            status_code=500, detail="agent.py not found in the output directory."
+            )
+        try:
+            import threading
+            print(output_dir)
+            process = subprocess.Popen(
+                [sys.executable, "generated_state_machine.py"],
+                cwd=output_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1  # Line-buffered output
+            )
+
+            # Stream logs line by line
+            # Use a global variable to store the previous process
+            global agent_process
+            try:
+                # If a previous process exists, terminate it
+                if 'agent_process' in globals() and agent_process is not None:
+                    agent_process.terminate()
+                    agent_process.wait(timeout=5)
+            except Exception as e:
+                print(f"Failed to terminate previous agent process: {e}")
+
+            agent_process = process  # Store the new process globally
+            # Store the process globally so we can terminate it if a new agent is pushed
+
+            def stream_output(stream, label):
+                for line in stream:
+                    print(f"[{label}] {line}", end='')
+
+            # Create threads to handle stdout and stderr
+            threading.Thread(target=stream_output, args=(process.stdout, 'STDOUT'), daemon=True).start()
+            threading.Thread(target=stream_output, args=(process.stderr, 'STDERR'), daemon=True).start()
+            return {"status": "ok", "message": "agent.py script has been started."}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to start agent.py: {str(e)}")
+
+    except HTTPException as e:
+        # Handle known exceptions with specific status codes
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise e
+    except Exception as e:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
  
 @api.post("/export-buml")
 async def export_buml(input_data: ClassDiagramInput):
